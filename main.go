@@ -75,6 +75,7 @@ func (p *Pinger) Run() {
 		return
 	}
 	//wg := sync.WaitGroup{}
+	closed := make(chan interface{})
 
 	interval := time.NewTicker(p.Interval)
 
@@ -98,6 +99,10 @@ func (p *Pinger) Run() {
 			Rtt := time.Since(bytesToTime(pkt.Data[:8]))
 			fmt.Printf("RTT is %s\n", Rtt)
 			p.PacketRecv++
+			if p.PacketRecv == p.Count {
+				close(closed)
+				return
+			}
 		}
 	}()
 
@@ -108,10 +113,8 @@ func (p *Pinger) Run() {
 		select {
 		case <-interval.C:
 			_ = p.sendICMP(conn)
-		default:
-			if p.Count > 0 && p.PacketRecv >= p.Count {
-				return
-			}
+		case <-closed:
+			return
 		}
 	}
 }
