@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sync"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -18,6 +19,9 @@ Usage:
 Example:
 # ping google continuely
 ping www.google.com
+
+# ping google 5 times
+ping -c 5 www.google.com
 `
 
 func NewPinger(host string) (*Pinger, error) {
@@ -33,6 +37,7 @@ type Pinger struct {
 	ipaddr     *net.IPAddr
 	addr       string
 	sourceAddr string
+	Count      int
 }
 
 func (p *Pinger) SetAddr(addr string) error {
@@ -59,15 +64,14 @@ func (p *Pinger) IPAddr() *net.IPAddr {
 }
 
 func (p *Pinger) Run() {
-	fmt.Println("0 Pinger Run")
 	conn, err := icmp.ListenPacket("ip4:icmp", p.sourceAddr)
-	fmt.Println("1 Pinger Run")
 
 	if err != nil {
 		fmt.Printf("err: %s\n", err)
 		return
 	}
-	fmt.Println("Pinger Run")
+
+	wg := sync.WaitGroup{}
 
 	go func() {
 		for {
@@ -77,20 +81,21 @@ func (p *Pinger) Run() {
 			if err != nil {
 				return
 			}
-			fmt.Printf("bytes receiverd %s, %d\n", bytesGot, n)
+			//fmt.Printf("bytes receiverd %s, %d\n", bytesGot, n)
 
 			rm, err := icmp.ParseMessage(1, bytesGot[:n])
 			if err != nil {
 				return
 			}
-			fmt.Printf("bytes received: %v, %d\n", rm, n)
+			//fmt.Printf("bytes received: %v, %d\n", rm, n)
 
 			pkt := rm.Body.(*icmp.Echo)
 			Rtt := time.Since(bytesToTime(pkt.Data[:8]))
 			fmt.Printf("RTT is %s\n", Rtt)
+			wg.Done()
 		}
 	}()
-
+	i := 0
 	for {
 		bytes, err := (&icmp.Message{
 			Type: ipv4.ICMPTypeEcho, Code: 0,
@@ -111,16 +116,26 @@ func (p *Pinger) Run() {
 			time.Sleep(time.Second * 10)
 			continue
 		}
-		time.Sleep(time.Second * 10)
+		wg.Add(1)
+		i++
+		if i == p.Count {
+			break
+		}
+
+		time.Sleep(time.Second * 3)
 	}
+	wg.Wait()
 }
 
-func (p *Pinger) sendICMP(conn *icmp.PacketConn) {}
+//func (p *Pinger) sendICMP(conn *icmp.PacketConn) {}
 
 func main() {
 	flag.Usage = func() {
 		fmt.Printf(usage)
 	}
+
+	count := flag.Int("c", -1, "")
+
 	flag.Parse()
 
 	if flag.NArg() == 0 {
@@ -135,14 +150,14 @@ func main() {
 		return
 	}
 	fmt.Printf("PING %s (%s)\n", pinger.Addr(), pinger.IPAddr())
-
+	pinger.Count = *count
 	pinger.Run()
 }
 
 func bytesToTime(b []byte) time.Time {
 	var nsec int64
 	for i := uint8(0); i < 8; i++ {
-		nsec += int64(b[i] << ((7 - i) * 8))
+		nsec += int64(b[i]) << ((7 - i) * 8)
 	}
 	return time.Unix(nsec/1000000000, nsec%1000000000)
 }
@@ -151,7 +166,7 @@ func timeToBytes(t time.Time) []byte {
 	nsec := t.UnixNano()
 	b := make([]byte, 8)
 	for i := uint8(0); i < 8; i++ {
-		b[i] = byte(nsec >> ((7 - i) * 8) & 0xff)
+		b[i] = byte((nsec >> ((7 - i) * 8)) & 0xff)
 	}
 	return b
 }
