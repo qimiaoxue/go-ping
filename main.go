@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"sync"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -42,6 +41,7 @@ type Pinger struct {
 	sourceAddr string
 	Count      int
 	Interval   time.Duration
+	PacketRecv int
 }
 
 func (p *Pinger) SetAddr(addr string) error {
@@ -74,8 +74,9 @@ func (p *Pinger) Run() {
 		fmt.Printf("err: %s\n", err)
 		return
 	}
+	//wg := sync.WaitGroup{}
 
-	wg := sync.WaitGroup{}
+	interval := time.NewTicker(p.Interval)
 
 	go func() {
 		for {
@@ -96,42 +97,47 @@ func (p *Pinger) Run() {
 			pkt := rm.Body.(*icmp.Echo)
 			Rtt := time.Since(bytesToTime(pkt.Data[:8]))
 			fmt.Printf("RTT is %s\n", Rtt)
-			wg.Done()
+			p.PacketRecv++
 		}
 	}()
-	i := 0
+
+	_ = p.sendICMP(conn)
+
 	for {
-		bytes, err := (&icmp.Message{
-			Type: ipv4.ICMPTypeEcho, Code: 0,
-			Body: &icmp.Echo{
-				ID:   rand.Intn(65535),
-				Seq:  1,
-				Data: timeToBytes(time.Now()),
-			},
-		}).Marshal(nil)
-
-		if err != nil {
-			time.Sleep(p.Interval)
-			continue
+		//fmt.Println("time.interval: ", time.Now())
+		select {
+		case <-interval.C:
+			_ = p.sendICMP(conn)
+		default:
+			if p.Count > 0 && p.PacketRecv >= p.Count {
+				return
+			}
 		}
-
-		_, err = conn.WriteTo(bytes, p.ipaddr)
-		if err != nil {
-			time.Sleep(p.Interval)
-			continue
-		}
-		wg.Add(1)
-		i++
-		if i == p.Count {
-			break
-		}
-
-		time.Sleep(p.Interval)
 	}
-	wg.Wait()
 }
 
-//func (p *Pinger) sendICMP(conn *icmp.PacketConn) {}
+func (p *Pinger) sendICMP(conn *icmp.PacketConn) error {
+	bytes, err := (&icmp.Message{
+		Type: ipv4.ICMPTypeEcho, Code: 0,
+		Body: &icmp.Echo{
+			ID:   rand.Intn(65535),
+			Seq:  1,
+			Data: timeToBytes(time.Now()),
+		},
+	}).Marshal(nil)
+
+	if err != nil {
+		time.Sleep(p.Interval)
+		return err
+	}
+
+	_, err = conn.WriteTo(bytes, p.ipaddr)
+	if err != nil {
+		time.Sleep(p.Interval)
+		return err
+	}
+	return err
+}
 
 func main() {
 	flag.Usage = func() {
