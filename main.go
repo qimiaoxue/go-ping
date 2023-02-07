@@ -22,6 +22,9 @@ ping www.google.com
 
 # ping google 5 times
 ping -c 5 www.google.com
+
+#ping google 5 times at 500ms intervals
+ping -c 5 -i 500ms www.google.com
 `
 
 func NewPinger(host string) (*Pinger, error) {
@@ -38,6 +41,7 @@ type Pinger struct {
 	addr       string
 	sourceAddr string
 	Count      int
+	Interval   time.Duration
 }
 
 func (p *Pinger) SetAddr(addr string) error {
@@ -107,13 +111,13 @@ func (p *Pinger) Run() {
 		}).Marshal(nil)
 
 		if err != nil {
-			time.Sleep(time.Second * 10)
+			time.Sleep(p.Interval)
 			continue
 		}
 
 		_, err = conn.WriteTo(bytes, p.ipaddr)
 		if err != nil {
-			time.Sleep(time.Second * 10)
+			time.Sleep(p.Interval)
 			continue
 		}
 		wg.Add(1)
@@ -122,7 +126,7 @@ func (p *Pinger) Run() {
 			break
 		}
 
-		time.Sleep(time.Second * 3)
+		time.Sleep(p.Interval)
 	}
 	wg.Wait()
 }
@@ -135,6 +139,7 @@ func main() {
 	}
 
 	count := flag.Int("c", -1, "")
+	interval := flag.Duration("i", time.Second, "")
 
 	flag.Parse()
 
@@ -151,6 +156,7 @@ func main() {
 	}
 	fmt.Printf("PING %s (%s)\n", pinger.Addr(), pinger.IPAddr())
 	pinger.Count = *count
+	pinger.Interval = *interval
 	pinger.Run()
 }
 
