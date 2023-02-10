@@ -1,10 +1,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -24,10 +29,15 @@ ping -c 5 www.google.com
 
 #ping google 5 times at 500ms intervals
 ping -c 5 -i 500ms www.google.com
+
+$ping google for 10 seconds
+ping -t 10s www.google.com
 `
 
+const UDP = "udp"
+
 func NewPinger(host string) (*Pinger, error) {
-	p := &Pinger{}
+	p := &Pinger{stat: &Stat{}, network: UDP}
 	err := p.SetAddr(host)
 	if err != nil {
 		return nil, err
@@ -42,6 +52,23 @@ type Pinger struct {
 	Count      int
 	Interval   time.Duration
 	PacketRecv int
+	Timeout    time.Duration
+	sequence   int
+	stat       *Stat
+	network    string
+}
+
+type Stat struct {
+	PacketRecv int
+	PacketSent int
+	PacketLoss float64
+	Rtts       []time.Duration
+	MinRtt     time.Duration
+	MaxRtt     time.Duration
+	AvgRtt     time.Duration
+	SumRtt     time.Duration
+	SumSqrtRtt time.Duration
+	StdDevRtt  time.Duration
 }
 
 func (p *Pinger) SetAddr(addr string) error {
@@ -67,8 +94,32 @@ func (p *Pinger) IPAddr() *net.IPAddr {
 	return p.ipaddr
 }
 
+func (p *Pinger) finish() {
+	stat := p.Stat()
+	fmt.Printf("\n--- %s ping statistics ---\n", p.addr)
+	fmt.Printf("%d packets transmitted, %d packets received, %v%% packet loss\n", stat.PacketSent, stat.PacketRecv, stat.PacketLoss)
+	fmt.Printf("round-trip min/avg/max/stddev = %v/%v/%v/%v\n", stat.MinRtt, stat.AvgRtt, stat.MaxRtt, stat.StdDevRtt)
+}
+
+func (p *Pinger) Stat() *Stat {
+	p.stat.PacketLoss = float64(p.stat.PacketSent-p.stat.PacketRecv) / float64(p.stat.PacketSent) * 100
+	if len(p.stat.Rtts) > 0 {
+		p.stat.StdDevRtt = time.Duration(math.Sqrt(float64(p.stat.SumSqrtRtt / time.Duration(len(p.stat.Rtts)))))
+	}
+	return p.stat
+}
+
 func (p *Pinger) Run() {
-	conn, err := icmp.ListenPacket("ip4:icmp", p.sourceAddr)
+	ctxtimeout, cancel := context.WithTimeout(context.Background(), p.Timeout)
+	defer cancel()
+	defer p.finish()
+
+	proto := "ip4:icmp"
+	if p.network == "udp" {
+		proto = "udp4"
+	}
+
+	conn, err := icmp.ListenPacket(proto, p.sourceAddr)
 
 	if err != nil {
 		fmt.Printf("err: %s\n", err)
@@ -78,6 +129,7 @@ func (p *Pinger) Run() {
 	closed := make(chan interface{})
 
 	interval := time.NewTicker(p.Interval)
+	//timeout := time.NewTicker(p.Timeout)
 
 	go func() {
 		for {
@@ -88,8 +140,8 @@ func (p *Pinger) Run() {
 				return
 			}
 			//fmt.Printf("bytes receiverd %s, %d\n", bytesGot, n)
-
-			rm, err := icmp.ParseMessage(1, bytesGot[:n])
+			bytes := ipv4PayLoad(bytesGot)
+			rm, err := icmp.ParseMessage(1, bytes[:n])
 			if err != nil {
 				return
 			}
@@ -97,7 +149,20 @@ func (p *Pinger) Run() {
 
 			pkt := rm.Body.(*icmp.Echo)
 			Rtt := time.Since(bytesToTime(pkt.Data[:8]))
-			fmt.Printf("RTT is %s\n", Rtt)
+			//fmt.Printf("RTT is %s\n", Rtt)
+			fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v\n", n, p.ipaddr, pkt.Seq, Rtt)
+			p.stat.PacketRecv += 1
+			p.stat.Rtts = append(p.stat.Rtts, Rtt)
+			if Rtt > p.stat.MaxRtt {
+				p.stat.MaxRtt = Rtt
+			}
+
+			if p.stat.MinRtt == 0 || Rtt < p.stat.MinRtt {
+				p.stat.MinRtt = Rtt
+			}
+			p.stat.SumRtt += Rtt
+			p.stat.AvgRtt = p.stat.SumRtt / time.Duration(len(p.stat.Rtts))
+			p.stat.SumSqrtRtt += (Rtt - p.stat.AvgRtt) * (Rtt - p.stat.AvgRtt)
 			p.PacketRecv++
 			if p.PacketRecv == p.Count {
 				close(closed)
@@ -107,10 +172,19 @@ func (p *Pinger) Run() {
 	}()
 
 	_ = p.sendICMP(conn)
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt)
+	signal.Notify(c, syscall.SIGTERM)
 
 	for {
 		//fmt.Println("time.interval: ", time.Now())
 		select {
+		//case <-timeout.C:
+		//return
+		case <-c:
+			return
+		case <-ctxtimeout.Done():
+			return
 		case <-interval.C:
 			_ = p.sendICMP(conn)
 		case <-closed:
@@ -124,7 +198,7 @@ func (p *Pinger) sendICMP(conn *icmp.PacketConn) error {
 		Type: ipv4.ICMPTypeEcho, Code: 0,
 		Body: &icmp.Echo{
 			ID:   rand.Intn(65535),
-			Seq:  1,
+			Seq:  p.sequence,
 			Data: timeToBytes(time.Now()),
 		},
 	}).Marshal(nil)
@@ -134,11 +208,18 @@ func (p *Pinger) sendICMP(conn *icmp.PacketConn) error {
 		return err
 	}
 
-	_, err = conn.WriteTo(bytes, p.ipaddr)
+	var dst net.Addr = p.ipaddr
+	if p.network == "udp" {
+		dst = &net.UDPAddr{IP: p.ipaddr.IP, Zone: p.ipaddr.Zone}
+	}
+
+	_, err = conn.WriteTo(bytes, dst)
 	if err != nil {
 		time.Sleep(p.Interval)
 		return err
 	}
+	p.sequence += 1
+	p.stat.PacketSent += 1
 	return err
 }
 
@@ -149,6 +230,8 @@ func main() {
 
 	count := flag.Int("c", -1, "")
 	interval := flag.Duration("i", time.Second, "")
+	timeout := flag.Duration("t", time.Second*100000, "")
+	privileged := flag.Bool("privileged", false, "")
 
 	flag.Parse()
 
@@ -166,6 +249,8 @@ func main() {
 	fmt.Printf("PING %s (%s)\n", pinger.Addr(), pinger.IPAddr())
 	pinger.Count = *count
 	pinger.Interval = *interval
+	pinger.Timeout = *timeout
+	pinger.setPrivileged(*privileged)
 	pinger.Run()
 }
 
@@ -184,4 +269,20 @@ func timeToBytes(t time.Time) []byte {
 		b[i] = byte((nsec >> ((7 - i) * 8)) & 0xff)
 	}
 	return b
+}
+
+func ipv4PayLoad(b []byte) []byte {
+	if len(b) < ipv4.HeaderLen {
+		return b
+	}
+	hdrlen := int(b[0]&0x0f) << 2
+	return b[hdrlen:]
+}
+
+func (p *Pinger) setPrivileged(privileged bool) {
+	if privileged {
+		p.network = "ip"
+	} else {
+		p.network = "udp"
+	}
 }
