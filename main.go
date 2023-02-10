@@ -212,15 +212,19 @@ func (p *Pinger) sendICMP(conn *icmp.PacketConn) error {
 	if p.network == "udp" {
 		dst = &net.UDPAddr{IP: p.ipaddr.IP, Zone: p.ipaddr.Zone}
 	}
-
-	_, err = conn.WriteTo(bytes, dst)
-	if err != nil {
-		time.Sleep(p.Interval)
-		return err
+	for {
+		if _, err = conn.WriteTo(bytes, dst); err != nil {
+			if neterr, ok := err.(*net.OpError); ok {
+				if neterr.Err == syscall.ENOBUFS {
+					continue
+				}
+			}
+		}
+		p.sequence += 1
+		p.stat.PacketSent += 1
+		break
 	}
-	p.sequence += 1
-	p.stat.PacketSent += 1
-	return err
+	return nil
 }
 
 func main() {
