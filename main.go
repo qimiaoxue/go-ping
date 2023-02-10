@@ -37,7 +37,11 @@ ping -t 10s www.google.com
 const UDP = "udp"
 
 func NewPinger(host string) (*Pinger, error) {
-	p := &Pinger{stat: &Stat{}, network: UDP}
+	p := &Pinger{
+		stat:    &Stat{},
+		network: UDP,
+		closed:  make(chan interface{}),
+	}
 	err := p.SetAddr(host)
 	if err != nil {
 		return nil, err
@@ -56,6 +60,7 @@ type Pinger struct {
 	sequence   int
 	stat       *Stat
 	network    string
+	closed     chan interface{}
 }
 
 type Stat struct {
@@ -133,41 +138,7 @@ func (p *Pinger) Run() {
 
 	go func() {
 		for {
-			bytesGot := make([]byte, 512)
-			n, _, err := conn.ReadFrom(bytesGot)
-
-			if err != nil {
-				return
-			}
-			//fmt.Printf("bytes receiverd %s, %d\n", bytesGot, n)
-			bytes := ipv4PayLoad(bytesGot)
-			rm, err := icmp.ParseMessage(1, bytes[:n])
-			if err != nil {
-				return
-			}
-			//fmt.Printf("bytes received: %v, %d\n", rm, n)
-
-			pkt := rm.Body.(*icmp.Echo)
-			Rtt := time.Since(bytesToTime(pkt.Data[:8]))
-			//fmt.Printf("RTT is %s\n", Rtt)
-			fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v\n", n, p.ipaddr, pkt.Seq, Rtt)
-			p.stat.PacketRecv += 1
-			p.stat.Rtts = append(p.stat.Rtts, Rtt)
-			if Rtt > p.stat.MaxRtt {
-				p.stat.MaxRtt = Rtt
-			}
-
-			if p.stat.MinRtt == 0 || Rtt < p.stat.MinRtt {
-				p.stat.MinRtt = Rtt
-			}
-			p.stat.SumRtt += Rtt
-			p.stat.AvgRtt = p.stat.SumRtt / time.Duration(len(p.stat.Rtts))
-			p.stat.SumSqrtRtt += (Rtt - p.stat.AvgRtt) * (Rtt - p.stat.AvgRtt)
-			p.PacketRecv++
-			if p.PacketRecv == p.Count {
-				close(closed)
-				return
-			}
+			_ = p.recvICMP(conn)
 		}
 	}()
 
@@ -191,6 +162,39 @@ func (p *Pinger) Run() {
 			return
 		}
 	}
+}
+func (p *Pinger) recvICMP(conn *icmp.PacketConn) error {
+	bytesGot := make([]byte, 512)
+	n, _, err := conn.ReadFrom(bytesGot)
+	if err != nil {
+		return err
+	}
+	bytes := ipv4PayLoad(bytesGot)
+	rm, err := icmp.ParseMessage(1, bytes[:n])
+	if err != nil {
+		return err
+	}
+	pkt := rm.Body.(*icmp.Echo)
+	Rtt := time.Since(bytesToTime(pkt.Data[:8]))
+	fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v\n", n, p.ipaddr, pkt.Seq, Rtt)
+	p.stat.PacketRecv += 1
+	p.stat.Rtts = append(p.stat.Rtts, Rtt)
+	if Rtt > p.stat.MaxRtt {
+		p.stat.MaxRtt = Rtt
+	}
+
+	if p.stat.MinRtt == 0 || Rtt < p.stat.MinRtt {
+		p.stat.MinRtt = Rtt
+	}
+	p.stat.SumRtt += Rtt
+	p.stat.AvgRtt = p.stat.SumRtt / time.Duration(len(p.stat.Rtts))
+	p.stat.SumSqrtRtt += (Rtt - p.stat.AvgRtt) * (Rtt - p.stat.AvgRtt)
+	p.PacketRecv++
+	if p.PacketRecv == p.Count {
+		close(p.closed)
+		return nil
+	}
+	return nil
 }
 
 func (p *Pinger) sendICMP(conn *icmp.PacketConn) error {
