@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,7 +19,7 @@ import (
 
 var usage = `
 Usage:
-	ping host
+	ping [-c count] [-i interval] [-t timeout] [--privileged] host
 	
 Example:
 # ping google continuely
@@ -32,6 +33,9 @@ ping -c 5 -i 500ms www.google.com
 
 $ping google for 10 seconds
 ping -t 10s www.google.com
+
+#ping a google raw ICMP ping
+sudo ping --privileged www.google.com
 `
 
 const UDP = "udp"
@@ -49,6 +53,11 @@ func NewPinger(host string) (*Pinger, error) {
 	return p, nil
 }
 
+type packet struct {
+	bytes  []byte
+	nbytes int
+}
+
 type Pinger struct {
 	ipaddr     *net.IPAddr
 	addr       string
@@ -61,6 +70,15 @@ type Pinger struct {
 	stat       *Stat
 	network    string
 	closed     chan interface{}
+	OnRecv     func(*Packet)
+	OnFinish   func(*Stat)
+}
+
+type Packet struct {
+	Rtt    time.Duration
+	IPAddr *net.IPAddr
+	Nbytes int
+	Seq    int
 }
 
 type Stat struct {
@@ -101,9 +119,10 @@ func (p *Pinger) IPAddr() *net.IPAddr {
 
 func (p *Pinger) finish() {
 	stat := p.Stat()
-	fmt.Printf("\n--- %s ping statistics ---\n", p.addr)
-	fmt.Printf("%d packets transmitted, %d packets received, %v%% packet loss\n", stat.PacketSent, stat.PacketRecv, stat.PacketLoss)
-	fmt.Printf("round-trip min/avg/max/stddev = %v/%v/%v/%v\n", stat.MinRtt, stat.AvgRtt, stat.MaxRtt, stat.StdDevRtt)
+	handler := p.OnFinish
+	if handler != nil {
+		handler(stat)
+	}
 }
 
 func (p *Pinger) Stat() *Stat {
@@ -119,6 +138,9 @@ func (p *Pinger) Run() {
 	defer cancel()
 	defer p.finish()
 
+	var wg sync.WaitGroup
+	wg.Add(1)
+
 	proto := "ip4:icmp"
 	if p.network == "udp" {
 		proto = "udp4"
@@ -130,17 +152,12 @@ func (p *Pinger) Run() {
 		fmt.Printf("err: %s\n", err)
 		return
 	}
-	//wg := sync.WaitGroup{}
-	closed := make(chan interface{})
+
+	recv := make(chan *packet, 5)
 
 	interval := time.NewTicker(p.Interval)
-	//timeout := time.NewTicker(p.Timeout)
 
-	go func() {
-		for {
-			_ = p.recvICMP(conn)
-		}
-	}()
+	go p.recvICMP(conn, recv, &wg)
 
 	_ = p.sendICMP(conn)
 	c := make(chan os.Signal, 1)
@@ -153,36 +170,81 @@ func (p *Pinger) Run() {
 		//case <-timeout.C:
 		//return
 		case <-c:
+			close(p.closed)
 			return
 		case <-ctxtimeout.Done():
+			close(p.closed)
 			return
 		case <-interval.C:
 			_ = p.sendICMP(conn)
-		case <-closed:
+		case r := <-recv:
+			err := p.processPacket(r)
+			if err != nil {
+				fmt.Println("FATAL: ", err.Error())
+			}
+		case <-p.closed:
+			wg.Wait()
 			return
 		}
 	}
 }
-func (p *Pinger) recvICMP(conn *icmp.PacketConn) error {
-	bytesGot := make([]byte, 512)
-	n, _, err := conn.ReadFrom(bytesGot)
-	if err != nil {
-		return err
+func (p *Pinger) recvICMP(conn *icmp.PacketConn, recv chan<- *packet, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		select {
+		case <-p.closed:
+			return
+		default:
+			bytesGot := make([]byte, 512)
+			conn.SetReadDeadline(time.Now().Add(time.Millisecond * 100))
+			n, _, err := conn.ReadFrom(bytesGot)
+			if err != nil {
+				if neterr, ok := err.(*net.OpError); ok {
+					if neterr.Timeout() {
+						continue
+					} else {
+						close(p.closed)
+						return
+					}
+				}
+			}
+			recv <- &packet{bytes: bytesGot, nbytes: n}
+		}
 	}
+}
+
+func (p *Pinger) processPacket(packet *packet) error {
+	bytesGot := packet.bytes
+	n := packet.nbytes
 	bytes := ipv4PayLoad(bytesGot)
 	rm, err := icmp.ParseMessage(1, bytes[:n])
 	if err != nil {
 		return err
 	}
-	pkt := rm.Body.(*icmp.Echo)
-	Rtt := time.Since(bytesToTime(pkt.Data[:8]))
-	fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v\n", n, p.ipaddr, pkt.Seq, Rtt)
+	outpkt := &Packet{
+		Nbytes: packet.nbytes,
+		IPAddr: p.ipaddr,
+	}
+	var Rtt time.Duration
+	switch pkt := rm.Body.(type) {
+	case *icmp.Echo:
+		Rtt = time.Since(bytesToTime(pkt.Data[:8]))
+		outpkt.Rtt = Rtt
+		Seq := pkt.Seq
+		outpkt.Seq = Seq
+		//fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v\n", n, p.ipaddr, Seq, Rtt)
+	default:
+		return fmt.Errorf("Error, invalid ICMP echo reply. Body type: %T, %s", pkt, pkt)
+	}
 	p.stat.PacketRecv += 1
 	p.stat.Rtts = append(p.stat.Rtts, Rtt)
 	if Rtt > p.stat.MaxRtt {
 		p.stat.MaxRtt = Rtt
 	}
-
+	handler := p.OnRecv
+	if handler != nil {
+		handler(outpkt)
+	}
 	if p.stat.MinRtt == 0 || Rtt < p.stat.MinRtt {
 		p.stat.MinRtt = Rtt
 	}
@@ -253,6 +315,17 @@ func main() {
 	if err != nil {
 		fmt.Printf("ERROR: %s\n", err.Error())
 		return
+	}
+
+	pinger.OnRecv = func(pkt *Packet) {
+		fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v\n", pkt.Nbytes, pkt.IPAddr, pkt.Seq, pkt.Rtt)
+	}
+
+	pinger.OnFinish = func(stat *Stat) {
+		fmt.Printf("\n--- %s ping statistics ---\n", pinger.addr)
+		fmt.Printf("%d packets transmitted, %d packets received, %v%% packet loss\n", stat.PacketSent, stat.PacketRecv, stat.PacketLoss)
+		fmt.Printf("round-trip min/avg/max/stddev = %v/%v/%v/%v\n", stat.MinRtt, stat.AvgRtt, stat.MaxRtt, stat.StdDevRtt)
+
 	}
 	fmt.Printf("PING %s (%s)\n", pinger.Addr(), pinger.IPAddr())
 	pinger.Count = *count
