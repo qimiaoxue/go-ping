@@ -1,6 +1,6 @@
 # go-ping
 ICMP Ping library for Go
-[![GoDoc](https://github.com/qimiaoxue/go-ping?status.svg)](https://github.com/qimiaoxue/go-ping)
+[![GoDoc](https://godoc.org/github.com/qimiaoxue/go-ping?status.svg)](https://godoc.org/github.com/qimiaoxue/go-ping)
 
 ICMP Ping library for Go, inspired by
 [go-fastping](https://github.com/tatsushid/go-fastping)
