@@ -1,4 +1,4 @@
-module ying
+module github.com/qimiaoxue/ying 
 
 go 1.18
 
