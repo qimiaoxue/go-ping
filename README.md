@@ -1,3 +1,10 @@
+# go-ping
+ICMP Ping library for Go
+[![GoDoc](https://github.com/qimiaoxue/go-ping?status.svg)](https://github.com/qimiaoxue/go-ping)
+
+ICMP Ping library for Go, inspired by
+[go-fastping](https://github.com/tatsushid/go-fastping)
+
 Here is a very simple example that sends & receive 3 packets:
 ```go
 
@@ -33,3 +40,16 @@ pinger.Run()
 It sends ICMP packet(s) and waits for a response. If it receives a response, it calls the "receive" callback. When it's finished, it calls the "finish" callback.
 
 For a full ping example, see "cmd/ping/ping.go".
+
+## Installation:
+
+```
+go get github.com/qimiaoxue/go-ping
+```
+
+To install the native Go ping executable:
+
+```bash
+go get github.com/qimiaoxue/go-ping/...
+$GOPATH/bin/ping
+```
